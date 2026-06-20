@@ -1,4 +1,4 @@
-//PulsarGG 1.0
+//PulsarGG 1.0 (с) GGee64
 
 #define INITGUID
 #include <windows.h>
@@ -702,7 +702,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         nid.cbSize = sizeof(NOTIFYICONDATA); nid.hWnd = hMainWnd = hwnd; nid.uID = 1; nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_USER + 1; nid.uVersion = NOTIFYICON_VERSION_4;
 
-        HICON hTempIcon = (HICON)LoadImageW(NULL, L"PulsarGG.ico", IMAGE_ICON, 256, 256, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+        HICON hTempIcon = (HICON)LoadImageW(GetModuleHandle(NULL),MAKEINTRESOURCE(1),IMAGE_ICON,GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),LR_DEFAULTCOLOR);
         if (!hTempIcon || hTempIcon == (HICON)-1) { OutputDebugStringW(L"[Tray] Equalizer.ico not found. Using fallback.\n"); hTempIcon = LoadIconW(NULL, IDI_APPLICATION); }
         nid.hIcon = hTempIcon; hTrayIcon = hTempIcon; wcscpy_s(nid.szTip, _countof(nid.szTip), L"Pulsar GG");
 
