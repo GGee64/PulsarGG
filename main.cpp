@@ -1,4 +1,4 @@
-//PulsarGG 1.0 (с) GGee64
+//PulsarGG v1.0.1 (c) GGee64
 
 #define INITGUID
 #include <windows.h>
@@ -365,6 +365,33 @@ public:
         // Fallback для DRM/SPDIF/зашифрованных выходов: считаем как float (безопаснее для loopback)
         if (!isFloat && pwfx->wFormatTag != WAVE_FORMAT_PCM) isFloat = true;
 
+        // ✅ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Нормализация по пику кадра (обходит системную громкость на любом выводе)
+        double maxInFrame = 0.0;
+        if (isFloat || pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+            const float* fSamp = reinterpret_cast<const float*>(pData);
+            for (UINT32 i = 0; i < numFrames; ++i) {
+                double s = fabsf(fSamp[i * ch + 0]); double r = fabsf(fSamp[i * ch + 1]);
+                if (s > maxInFrame) maxInFrame = s;
+                if (r > maxInFrame) maxInFrame = r;
+            }
+        }
+        else {
+            const int16_t* iSamp = reinterpret_cast<const int16_t*>(pData);
+            for (UINT32 i = 0; i < numFrames; ++i) {
+                double s = static_cast<double>(abs(iSamp[i * ch + 0])) / 32768.0;
+                double r = static_cast<double>(abs(iSamp[i * ch + 1])) / 32768.0;
+                if (s > maxInFrame) maxInFrame = s;
+                if (r > maxInFrame) maxInFrame = r;
+            }
+        }
+
+        // Ниже порога аппаратного шума → это тишина. Масштаб = 0 (убивает ложный пульс на 0% и дребезг волн)
+        const double SILENCE_FLOOR = 0.002;
+        float frameScale = (maxInFrame < SILENCE_FLOOR) ? 0.0f : (0.45f / static_cast<float>(maxInFrame));
+
+        // ВАЖНО: ReleaseBuffer вызывается ровно один раз после GetBuffer (по spec WASAPI)
+        pCaptureClient->ReleaseBuffer(numFrames);
+
         double totalEnergy = 0.0;
         float step = static_cast<float>(numFrames) / numBands;
         const void* samples = pData;
@@ -374,70 +401,36 @@ public:
             int endIdx = static_cast<int>(ceilf((band + 1) * step));
             if (endIdx > numFrames) endIdx = numFrames;
 
-            double sumSq = 0.0;
-            int count = 0;
+            double sumSq = 0.0; int count = 0;
 
-            if (isFloat) {
+            if (isFloat || pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
                 const float* fSamp = reinterpret_cast<const float*>(samples);
                 for (int i = startIdx; i < endIdx; ++i, ++count) {
-                    sumSq += static_cast<double>(fSamp[i * ch + 0]) * fSamp[i * ch + 0];
-                    sumSq += static_cast<double>(fSamp[i * ch + 1]) * fSamp[i * ch + 1];
+                    double sL = fabsf(fSamp[i * ch + 0]); double sR = fabsf(fSamp[i * ch + 1]);
+                    sumSq += sL * sL + sR * sR;
                 }
             }
             else {
                 const int16_t* iSamp = reinterpret_cast<const int16_t*>(samples);
                 for (int k = startIdx; k < endIdx; ++k, ++count) {
-                    float sL = static_cast<float>(iSamp[k * ch + 0]) / 32768.0f;
-                    float sR = static_cast<float>(iSamp[k * ch + 1]) / 32768.0f;
+                    float sL = static_cast<float>(abs(iSamp[k * ch + 0])) / 32768.0f;
+                    float sR = static_cast<float>(abs(iSamp[k * ch + 1])) / 32768.0f;
                     sumSq += sL * sL + sR * sR;
                 }
             }
 
             double rms = count > 0 ? sqrt(sumSq / count) : 0.0;
+            // Масштабируем RMS относительно пика кадра, а не абсолютного значения
+            float bandVal = static_cast<float>(rms * frameScale);
 
-            // ✅ РАЗДЕЛЬНОЕ УСИЛЕНИЕ (только тернарные операторы, НЕТ std::min/max)
-            float gain = 1.5f; // Фолбэк по умолчанию
-            if (pwfx->nSamplesPerSec == 48000 && pwfx->wBitsPerSample >= 24)      gain = 8.0f; // Колонки/Основной вывод
-            else                                                                       gain = 1.5f; // Наушники/SPDIF
-
-            // Клиппинг и порог тишины (твоя оригинальная логика)
-            float targetVal = static_cast<float>(rms * gain);
-            targets[band] = (targetVal < 0.0015f) ? 0.0f : (targetVal > 1.0f ? 1.0f : targetVal);
-
-            // ✅ ВОССТАНОВЛЕНО: накопление энергии для волн (без этого волны не работают в тишине)
+            targets[band] = (bandVal < 0.0f) ? 0.0f : ((bandVal > 1.0f) ? 1.0f : bandVal);
             totalEnergy += targets[band];
-        }
-
-        // Строго по WASAPI spec: ReleaseBuffer вызывается РОВНО один раз после успешного GetBuffer
-        pCaptureClient->ReleaseBuffer(numFrames);
-
-        // ✅ ВЫЧИСЛЕНИЕ СРЕДНЕЙ ЭНЕРГИИ КАДРА (контролирует визуальную высоту лучей)
-        float avgEnergy = 0.0f;
-        for (int i = 0; i < numBands; ++i) avgEnergy += targets[i];
-        avgEnergy /= static_cast<float>(numBands);
-
-        // Целевая высота пульса (подбирай под свой визуальный комфорт: 0.35–0.45 обычно идеально)
-        const float TARGET_AVG = 0.28f;
-
-        // Применяем глобальное усиление ТОЛЬКО если есть реальный сигнал и он не уперся в потолок
-        if (avgEnergy > 0.002f && avgEnergy < 1.45f) {
-            float globalGain = TARGET_AVG / avgEnergy;
-
-            // Жёсткие ограничители_gain'a без min/max (тернарные операторы)
-            globalGain = globalGain > 3.0f ? 3.0f : ((globalGain < 0.15f) ? 0.15f : globalGain);
-
-            for (int i = 0; i < numBands; ++i) targets[i] *= globalGain;
-        }
-
-        // Финальный клик в [0, 1] (гарантирует безартефактный рендеринг D2D)
-        for (int i = 0; i < numBands; ++i) {
-            if (targets[i] > 1.0f) targets[i] = 1.0f;
-            else if (targets[i] < 0.0f) targets[i] = 0.0f;
         }
 
         // ТВОЯ ЛОГИКА ОБНОВЛЕНИЯ БЕЗ ИЗМЕНЕНИЙ
         for (int i = 0; i < numBands; ++i) bands[i].update(targets[i]);
     }
+
 
     Band GetBand(int i) const {
         if (i < 0 || i >= numBands) return Band();
@@ -472,22 +465,31 @@ void DrawEqualizer(ID2D1HwndRenderTarget* rt, const OverlayState* state) {
     lastTick = std::chrono::steady_clock::now();
     waveT += dt * 1.5f;
 
-    // ✅ Нормализация энергии: сумма / кол-во полос → диапазон [0, 1]
+    // ✅ ИСПРАВЛЕНИЕ: Широкий гистерезис + плавное сглаживание убирают «дребезг» волн на 0-10% громкости
     float totalEnergy = 0.0f; for (int e = 0; e < NUM_BANDS; ++e) totalEnergy += data[e].value;
     float avgEnergy = totalEnergy / static_cast<float>(NUM_BANDS);
 
+    // Медленное экспоненциальное сглаживание (коэффициент 0.92 гасит микрофлуктуации AGC и шум DPC-петли колонок)
     static float smoothEnergy = 0.0f;
-    smoothEnergy = smoothEnergy * 0.85f + avgEnergy * 0.15f;
+    smoothEnergy = smoothEnergy * 0.92f + avgEnergy * 0.08f;
 
-    // Гистерезис: волны ТОЛЬКО при тишине, пульс ВЕЗДА по data[e].value
-    const float WAVE_OFF_THRESH = 0.03f;
-    const float WAVE_ON_THRESH = 0.005f;
+    // ✅ ПЛАВНАЯ ВОЛНА: ровный переход за 0.5с в любую сторону, без инерции на просадках FPS
+    const float WAVE_OFF_THRESH = 0.12f;
+    const float WAVE_ON_THRESH = 0.04f;
+    const float TRANSITION_TIME = 0.5f; // Длительность плавного хода в секундах
 
-    if (smoothEnergy > WAVE_OFF_THRESH) waveState = 0.0f; // Музыка → волны гасим
-    else if (smoothEnergy < WAVE_ON_THRESH && waveState < 0.1f) waveState = 1.0f; // Тишина → разрешаем
+    static float targetWave = 0.0f;
 
-    float fade = (8.0f * dt > 1.0f) ? 1.0f : 8.0f * dt;
-    waveState += (waveState < 1.0f ? (1.0f - waveState) : (0.0f - waveState)) * fade;
+    if (smoothEnergy > WAVE_OFF_THRESH) targetWave = 0.0f;       // Музыка → целимся вниз
+    else if (smoothEnergy < WAVE_ON_THRESH) targetWave = 1.0f;   // Тишина → целимся вверх
+
+    float diff = targetWave - waveState;
+    float maxStep = dt / TRANSITION_TIME;
+    if (maxStep > 1.0f) maxStep = 1.0f; // Защита от просадок FPS: не телепортируется при лагах окна
+
+    waveState += diff * ((fabsf(diff) <= maxStep) ? 1.0f : maxStep);
+    if (waveState < 0.0f) waveState = 0.0f;
+    if (waveState > 1.0f) waveState = 1.0f;
 
     float waveP[64];
     for (int i = 0; i < NUM_BANDS; ++i) {
@@ -702,7 +704,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         nid.cbSize = sizeof(NOTIFYICONDATA); nid.hWnd = hMainWnd = hwnd; nid.uID = 1; nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_USER + 1; nid.uVersion = NOTIFYICON_VERSION_4;
 
-        HICON hTempIcon = (HICON)LoadImageW(GetModuleHandle(NULL),MAKEINTRESOURCE(1),IMAGE_ICON,GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),LR_DEFAULTCOLOR);
+        HICON hTempIcon = (HICON)LoadImageW(NULL, L"PulsarGG.ico", IMAGE_ICON, 256, 256, LR_LOADFROMFILE | LR_DEFAULTSIZE);
         if (!hTempIcon || hTempIcon == (HICON)-1) { OutputDebugStringW(L"[Tray] Equalizer.ico not found. Using fallback.\n"); hTempIcon = LoadIconW(NULL, IDI_APPLICATION); }
         nid.hIcon = hTempIcon; hTrayIcon = hTempIcon; wcscpy_s(nid.szTip, _countof(nid.szTip), L"Pulsar GG");
 
